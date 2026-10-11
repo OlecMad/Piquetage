@@ -1,0 +1,228 @@
+name: Construire l'APK
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Une seule compilation a la fois par branche. Une compilation EN COURS n'est
+# jamais annulee par un nouvel envoi (cancel-in-progress: false) : le nouvel
+# envoi attend son tour. Avec « true », chaque commit (fichier modifie dans
+# GitHub, second televersement...) interrompait la compilation precedente :
+# « Error: The operation was canceled. »
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Premiere compilation : 8 a 15 min (telechargement de Gradle et des
+    # dependances Maven) ; les suivantes, cache aidant, 3 a 6 min.
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Recuperer le depot
+        uses: actions/checkout@v5
+
+      - name: Localiser le projet
+        id: proj
+        run: |
+          LOCK=$(find . -name package-lock.json -not -path '*/node_modules/*' -not -path './_src/*' | sort | head -n 1)
+          if [ -z "$LOCK" ]; then
+            ZIP=$(find . -maxdepth 2 -iname '*.zip' -not -path './.git/*' | sort -V | tail -n 1)
+            if [ -n "$ZIP" ]; then
+              echo "Archive trouvee : $ZIP (extraction)"
+              mkdir -p _src
+              unzip -q -o "$ZIP" -d _src
+              LOCK=$(find _src -name package-lock.json -not -path '*/node_modules/*' | sort | head -n 1)
+            fi
+          fi
+          if [ -z "$LOCK" ]; then
+            echo "::error title=Projet introuvable::Ni package-lock.json ni archive .zip du projet dans le depot. Deposer l'archive piquetage-vX.Y.Z.zip, ou les fichiers du projet (PROCEDURE_INSTALLATION.md, phase 2)."
+            echo "Contenu du depot :"; find . -maxdepth 3 -not -path './.git*' | sort
+            exit 1
+          fi
+          DIR=$(dirname "$LOCK")
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "Projet trouve dans : $DIR"
+
+      - name: Controle prealable (sans SDK)
+        run: |
+          DIR="${{ steps.proj.outputs.dir }}"
+          if [ -f "$DIR/tools/check-android.py" ]; then
+            python3 "$DIR/tools/check-android.py" "$DIR"
+          else
+            echo "::warning::tools/check-android.py absent : controle prealable ignore."
+          fi
+
+      - name: Installer Node.js 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ${{ steps.proj.outputs.dir }}/package-lock.json
+
+      - name: Installer Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # « packages » doit etre renseigne : la valeur par defaut de l'action,
+      # « tools platform-tools », echoue (« Failed to find package 'tools' »),
+      # le paquet « tools » ayant ete retire du depot Android.
+      - name: Preparer le SDK Android
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-36'
+
+      - name: Versions des outils
+        run: |
+          java -version 2>&1 | head -n 1
+          echo "node $(node -v) / npm $(npm -v)"
+          echo "SDK : $ANDROID_HOME"
+          echo "plates-formes : $(find "$ANDROID_HOME/platforms" -mindepth 1 -maxdepth 1 -printf '%f ' 2>/dev/null)"
+          echo "build-tools   : $(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -printf '%f ' 2>/dev/null)"
+
+      - name: Installer les dependances (npm ci)
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: npm ci --no-audit --no-fund
+
+      - name: Synchroniser les fichiers web dans le projet Android
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: npx cap sync android
+
+      - name: Mettre en cache Gradle
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/android/**/*.gradle', '**/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Compiler l'APK (Gradle)
+        working-directory: ${{ steps.proj.outputs.dir }}/android
+        run: |
+          chmod +x ./gradlew
+          # Memoire : le gabarit Capacitor fixe -Xmx1536m (gradle.properties), juste
+          # pour 7 modules dont 3 en Kotlin ; le serveur en offre 16 Go.
+          ./gradlew --no-daemon --stacktrace \
+            -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \
+            -Pkotlin.daemon.jvmargs=-Xmx2g \
+            assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/gradle.log"
+
+      - name: Renommer l'APK et verifier la signature
+        id: apk
+        run: |
+          DIR="${{ steps.proj.outputs.dir }}"
+          VERSION=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['version'])" "$DIR/package.json")
+          NAME="piquetage-v${VERSION}-$(date +%Y%m%d).apk"
+          mkdir -p dist
+          cp "$DIR/android/app/build/outputs/apk/debug/app-debug.apk" "dist/$NAME"
+          SHA=$(sha256sum "dist/$NAME" | cut -d' ' -f1)
+          SIZE=$(du -h "dist/$NAME" | cut -f1)
+          CERT="non verifie"
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f 2>/dev/null | sort -V | tail -n 1)
+          if [ -n "$APKSIGNER" ] && [ -x "$APKSIGNER" ]; then
+            "$APKSIGNER" verify "dist/$NAME"
+            CERT=$("$APKSIGNER" verify --print-certs "dist/$NAME" | grep -m1 'certificate SHA-256 digest' | awk '{print $NF}')
+            EXPECTED=098e11281ad5816e194a77f5403e29a6271603e0af535e736dc6d4add00cde60
+            if [ "$CERT" != "$EXPECTED" ]; then
+              echo "::warning title=Cle de signature inattendue::Certificat $CERT au lieu de la cle versionnee android/app/debug.keystore : l'APK ne s'installera pas par-dessus une version signee avec l'autre cle."
+            fi
+          fi
+          ls -lh dist/
+          {
+            echo "## APK pret"
+            echo ""
+            echo "| Fichier | Taille | SHA-256 de l'APK |"
+            echo "|---|---|---|"
+            echo "| \`$NAME\` | $SIZE | \`$SHA\` |"
+            echo ""
+            echo "Certificat de signature (SHA-256) : \`$CERT\`"
+            echo ""
+            echo "Telecharger l'artefact **piquetage-debug** en bas de cette page (fichier .zip contenant l'APK)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # APK signe avec la cle de debogage versionnee : suffisant pour une
+      # installation directe, insuffisant pour le Play Store (README, « Version signee »).
+      - name: Publier l'APK en artefact
+        uses: actions/upload-artifact@v6
+        with:
+          name: piquetage-debug
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Joindre l'APK a la release (sur tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*.apk
+          generate_release_notes: true
+
+      # ---------------------------------------------------------------- en cas d'echec
+      - name: Resumer l'erreur
+        if: failure() || cancelled()
+        run: |
+          LOG="$GITHUB_WORKSPACE/gradle.log"
+          INTERROMPU=0
+          if [ "${{ job.status }}" = "cancelled" ]; then INTERROMPU=1; fi
+          if [ -s "$LOG" ] && ! grep -qE 'BUILD (SUCCESSFUL|FAILED)|FAILURE:' "$LOG"; then INTERROMPU=1; fi
+          {
+            if [ "$INTERROMPU" = 1 ]; then
+              echo "## Compilation interrompue (ce n'est pas une erreur du projet)"
+              echo ""
+              echo "Gradle n'a signale aucune erreur : l'execution a ete arretee de l'exterieur."
+              echo "Lire le cadre **Annotations** de cette page :"
+              echo ""
+              echo "| Annotation | Cause | Que faire |"
+              echo "|---|---|---|"
+              echo "| *Canceling since a higher priority waiting request ... exists* | un nouvel envoi a remplace celui-ci | suivre l'execution la plus recente |"
+              echo "| *exceeded the maximum execution time* | delai de 60 min depasse | relancer (**Re-run all jobs**) et me transmettre la duree des etapes |"
+              echo "| *The runner has received a shutdown signal* | incident du serveur GitHub | relancer (**Re-run all jobs**) |"
+              echo "| aucune | annulation manuelle (bouton **Cancel workflow**) | relancer |"
+              if [ -s "$LOG" ]; then
+                echo ""
+                echo "Dernieres taches atteintes :"
+                echo ""
+                echo '```'
+                grep -E '^> Task ' "$LOG" | tail -n 3
+                echo '```'
+              fi
+            else
+              echo "## Echec de la compilation"
+              echo ""
+              if [ -s "$LOG" ]; then
+                echo "Extrait du journal Gradle, a copier et transmettre :"
+                echo ""
+                echo '```'
+                awk '/What went wrong:/{p=1} p{print} /\* Try:/{if(p) exit}' "$LOG" | head -n 60
+                grep -E '^e: |error: |FAILURE:|FAILED$' "$LOG" | head -n 30
+                echo '```'
+              else
+                echo "L'echec est survenu avant Gradle : ouvrir l'etape marquee en rouge et copier ses dernieres lignes."
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Joindre le journal complet
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v6
+        with:
+          name: journal-echec
+          path: |
+            gradle.log
+            ${{ steps.proj.outputs.dir }}/android/app/build/reports/
+            ${{ steps.proj.outputs.dir }}/android/build/reports/
+          if-no-files-found: ignore
+          retention-days: 14
